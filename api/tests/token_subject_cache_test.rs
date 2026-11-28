@@ -841,3 +841,72 @@ fn spec_rtp_19_warm_userinfo_runs_no_sql_besides_the_first_sight_revocation_chec
         }
     });
 }
+
+#[test]
+#[ignore = "requires PostgreSQL, run: cargo test -p ferriskey-api --test token_subject_cache_test -- --ignored"]
+fn ghsa_8pcj_7r68_hcpr_a_lockout_reached_through_reauthenticate_refuses_the_next_proof_at_once() {
+    let deployment = cached();
+    rt().block_on(async {
+        let _serial = SERIAL.lock().await;
+        let server = deployment.server(0);
+        let client = deployment.client().await;
+        let (user_id, username) = deployment.user(&server).await;
+        let session = deployment.login(&server, &client, &username).await;
+
+        let reauthenticate = |password: &'static str| {
+            server
+                .post(&deployment.path("/users/me/reauthenticate"))
+                .authorization_bearer(&session.access_token)
+                .json(&json!({ "password": password }))
+        };
+        let failures_before = login_failures_of(&deployment.pool, user_id).await;
+
+        for guess in 1..=10 {
+            let refused = reauthenticate("not-the-password").await;
+            assert_eq!(
+                refused.status_code(),
+                401,
+                "guess {guess}: {}",
+                refused.text()
+            );
+        }
+
+        let locked = reauthenticate(PASSWORD).await;
+        assert_eq!(locked.status_code(), 401, "{}", locked.text());
+        assert_eq!(
+            locked.json::<Value>()["reason"],
+            json!("account_locked"),
+            "the correct password must be refused while the account is locked"
+        );
+
+        let failures = login_failures_of(&deployment.pool, user_id).await;
+        assert_eq!(
+            failures.len() - failures_before.len(),
+            11,
+            "every refused proof must leave a login_failure event: {failures:?}"
+        );
+        assert_eq!(
+            failures
+                .iter()
+                .filter(|r| r == &"invalid_elevation_proof")
+                .count(),
+            10,
+            "{failures:?}"
+        );
+        assert_eq!(
+            failures.iter().filter(|r| r == &"account_locked").count(),
+            1,
+            "{failures:?}"
+        );
+    });
+}
+
+async fn login_failures_of(pool: &PgPool, user_id: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT details->>'reason' FROM security_events WHERE actor_id = $1 AND event_type = 'login_failure' ORDER BY timestamp",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .expect("read login failures")
+}

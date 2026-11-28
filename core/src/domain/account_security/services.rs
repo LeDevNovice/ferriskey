@@ -7,6 +7,7 @@ use ferriskey_domain::credential::entities::{Credential, CredentialData, Credent
 use ferriskey_domain::credential::ports::CredentialRepository;
 use ferriskey_domain::elevation::entities::{Elevated, ElevationId, ElevationProofKind};
 use ferriskey_domain::elevation::ports::ElevationRepository;
+use ferriskey_domain::realm::RealmId;
 use ferriskey_domain::realm::ports::RealmRepository;
 use ferriskey_domain::realm::scope::{RealmScope, Scoped};
 use ferriskey_domain::user::entities::{RequiredAction, User};
@@ -37,6 +38,8 @@ use crate::domain::account_security::entities::{
 use crate::domain::account_security::ports::{
     AccountSecurityService, OtherSessionsRevocationPort, PasskeyRegistrationRepository,
 };
+use crate::domain::seawatch::entities::{ActorType, EventStatus, SecurityEvent, SecurityEventType};
+use crate::domain::seawatch::ports::SecurityEventRepository;
 use crate::domain::trident::ports::OtpEnrollmentRepository;
 use crate::domain::trident::services::{
     build_webauthn_client, generate_otpauth_uri, generate_secret, verify,
@@ -47,7 +50,7 @@ pub const OTP_ENROLLMENT_TTL_MINUTES: i64 = 10;
 pub const PASSKEY_REGISTRATION_TTL_MINUTES: i64 = 5;
 
 #[derive(Clone, Debug)]
-pub struct AccountSecurityServiceImpl<CR, H, UR, RR, PPR, OER, URR, ER, OSR, URA, PRR>
+pub struct AccountSecurityServiceImpl<CR, H, UR, RR, PPR, OER, URR, ER, OSR, URA, PRR, SER>
 where
     CR: CredentialRepository,
     H: HasherRepository,
@@ -60,6 +63,7 @@ where
     OSR: OtherSessionsRevocationPort,
     URA: UserRequiredActionRepository,
     PRR: PasskeyRegistrationRepository,
+    SER: SecurityEventRepository,
 {
     pub(crate) credential_repository: Arc<CR>,
     pub(crate) hasher_repository: Arc<H>,
@@ -72,10 +76,11 @@ where
     pub(crate) other_sessions_revocation: Arc<OSR>,
     pub(crate) user_required_action_repository: Arc<URA>,
     pub(crate) passkey_registration_repository: Arc<PRR>,
+    pub(crate) security_event_repository: Arc<SER>,
 }
 
-impl<CR, H, UR, RR, PPR, OER, URR, ER, OSR, URA, PRR>
-    AccountSecurityServiceImpl<CR, H, UR, RR, PPR, OER, URR, ER, OSR, URA, PRR>
+impl<CR, H, UR, RR, PPR, OER, URR, ER, OSR, URA, PRR, SER>
+    AccountSecurityServiceImpl<CR, H, UR, RR, PPR, OER, URR, ER, OSR, URA, PRR, SER>
 where
     CR: CredentialRepository,
     H: HasherRepository,
@@ -88,6 +93,7 @@ where
     OSR: OtherSessionsRevocationPort,
     URA: UserRequiredActionRepository,
     PRR: PasskeyRegistrationRepository,
+    SER: SecurityEventRepository,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -102,6 +108,7 @@ where
         other_sessions_revocation: Arc<OSR>,
         user_required_action_repository: Arc<URA>,
         passkey_registration_repository: Arc<PRR>,
+        security_event_repository: Arc<SER>,
     ) -> Self {
         Self {
             credential_repository,
@@ -115,6 +122,7 @@ where
             other_sessions_revocation,
             user_required_action_repository,
             passkey_registration_repository,
+            security_event_repository,
         }
     }
 
@@ -174,7 +182,25 @@ where
         .await
     }
 
+    async fn record_login_failure(&self, realm_id: RealmId, user_id: Uuid, reason: &str) {
+        let event = SecurityEvent::new(
+            realm_id,
+            SecurityEventType::LoginFailure,
+            EventStatus::Failure,
+            user_id,
+        )
+        .with_actor(user_id, ActorType::User)
+        .with_details(serde_json::json!({ "reason": reason }));
+
+        if let Err(e) = self.security_event_repository.store_event(event).await {
+            warn!(user_id = %user_id, reason, "Failed to record a login failure in the audit log: {e:?}");
+        }
+    }
+
     async fn record_failed_proof(&self, scope: &RealmScope, user: &Scoped<User>) {
+        self.record_login_failure(scope.id(), user.get().id, "invalid_elevation_proof")
+            .await;
+
         let settings = match self.realm_repository.get_realm_settings(scope.id()).await {
             Ok(settings) => settings,
             Err(e) => {
@@ -273,8 +299,8 @@ where
     }
 }
 
-impl<CR, H, UR, RR, PPR, OER, URR, ER, OSR, URA, PRR> AccountSecurityService
-    for AccountSecurityServiceImpl<CR, H, UR, RR, PPR, OER, URR, ER, OSR, URA, PRR>
+impl<CR, H, UR, RR, PPR, OER, URR, ER, OSR, URA, PRR, SER> AccountSecurityService
+    for AccountSecurityServiceImpl<CR, H, UR, RR, PPR, OER, URR, ER, OSR, URA, PRR, SER>
 where
     CR: CredentialRepository,
     H: HasherRepository,
@@ -287,13 +313,25 @@ where
     OSR: OtherSessionsRevocationPort,
     URA: UserRequiredActionRepository,
     PRR: PasskeyRegistrationRepository,
+    SER: SecurityEventRepository,
 {
     async fn request_elevation(
         &self,
         identity: Identity,
         input: RequestElevationInput,
     ) -> Result<RequestElevationOutput, CoreError> {
-        let (scope, user) = self.caller(&identity, &input.realm_name).await?;
+        let (scope, user) = match self.caller(&identity, &input.realm_name).await {
+            Err(CoreError::AccountLocked) => {
+                if let Ok(scope) =
+                    RealmScope::resolve(self.realm_repository.as_ref(), &input.realm_name).await
+                {
+                    self.record_login_failure(scope.id(), identity.id(), "account_locked")
+                        .await;
+                }
+                return Err(CoreError::AccountLocked);
+            }
+            caller => caller?,
+        };
         let user_id = user.get().id;
 
         let (accepted, kind) = match &input.proof {
@@ -767,6 +805,7 @@ mod tests {
     use crate::domain::credential::ports::MockCredentialRepository;
     use crate::domain::password_policy::repository::MockPasswordPolicyRepository;
     use crate::domain::realm::ports::MockRealmRepository;
+    use crate::domain::seawatch::ports::MockSecurityEventRepository;
     use crate::domain::trident::ports::{
         MockOtpEnrollmentRepository, OtpEnrollment, WebAuthnRpInfo,
     };
@@ -793,6 +832,7 @@ mod tests {
         MockOtherSessionsRevocationPort,
         MockUserRequiredActionRepository,
         MockPasskeyRegistrationRepository,
+        MockSecurityEventRepository,
     >;
 
     const SECRET: &str = "JBSWY3DPEHPK3PXP";
@@ -809,6 +849,7 @@ mod tests {
         sessions: MockOtherSessionsRevocationPort,
         required_actions: MockUserRequiredActionRepository,
         passkey_registrations: MockPasskeyRegistrationRepository,
+        events: MockSecurityEventRepository,
     }
 
     impl Harness {
@@ -825,6 +866,7 @@ mod tests {
                 sessions: MockOtherSessionsRevocationPort::new(),
                 required_actions: MockUserRequiredActionRepository::new(),
                 passkey_registrations: MockPasskeyRegistrationRepository::new(),
+                events: MockSecurityEventRepository::new(),
             }
         }
 
@@ -841,6 +883,7 @@ mod tests {
                 Arc::new(self.sessions),
                 Arc::new(self.required_actions),
                 Arc::new(self.passkey_registrations),
+                Arc::new(self.events),
             )
         }
 
@@ -907,6 +950,18 @@ mod tests {
             self.users
                 .expect_reset_failed_login_attempts()
                 .returning(|_| Box::pin(async move { Ok(()) }));
+        }
+
+        fn auditing(&mut self, reason: &'static str) {
+            self.events
+                .expect_store_event()
+                .withf(move |event| {
+                    event.event_type == SecurityEventType::LoginFailure
+                        && event.status == EventStatus::Failure
+                        && event.details.as_ref().and_then(|d| d["reason"].as_str()) == Some(reason)
+                })
+                .times(1)
+                .returning(|_| Box::pin(async { Ok(()) }));
         }
 
         fn counting_failures(&mut self, realm_id: RealmId, threshold: i32) {
@@ -1348,6 +1403,7 @@ mod tests {
         let mut harness = Harness::new();
         harness.resolving(&realm, &user);
         harness.credentials.expect_get_password_credential().never();
+        harness.auditing("account_locked");
 
         let refused = harness
             .build()
@@ -1398,6 +1454,7 @@ mod tests {
         harness.resolving(&realm, &user);
         harness.with_password(user.id, false);
         harness.counting_failures(realm.id, 10);
+        harness.auditing("invalid_elevation_proof");
         harness
             .users
             .expect_increment_failed_login_attempts()
@@ -1429,6 +1486,7 @@ mod tests {
         harness.resolving(&realm, &user);
         harness.with_password(user.id, false);
         harness.counting_failures(realm.id, 10);
+        harness.auditing("invalid_elevation_proof");
         harness
             .users
             .expect_increment_failed_login_attempts()
@@ -1515,6 +1573,7 @@ mod tests {
             vec![credential_of(user.id, CredentialType::Password)],
         );
         harness.counting_failures(realm.id, 10);
+        harness.auditing("invalid_elevation_proof");
         harness
             .users
             .expect_increment_failed_login_attempts()

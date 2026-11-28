@@ -407,7 +407,7 @@ type ApplicationAccountSecurityService =
     crate::domain::account_security::services::AccountSecurityServiceImpl<
         CredentialRepo,
         HasherRepo,
-        UserRepo,
+        PostgresUserRepository,
         RealmRepo,
         PasswordPolicyRepo,
         OtpEnrollmentRepo,
@@ -416,6 +416,7 @@ type ApplicationAccountSecurityService =
         ApplicationOtherSessionsRevocation,
         UserRequiredActionRepo,
         PasskeyRegistrationRepo,
+        SecurityEventRepo,
     >;
 
 type MaintenanceWhitelistRepo = crate::infrastructure::maintenance::repositories::maintenance_whitelist_repository::PostgresMaintenanceWhitelistRepository;
