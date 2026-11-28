@@ -315,8 +315,9 @@ pub async fn create_service_with_secrets(
         cached_client,
         token_state.clone(),
     ));
+    let user_store = Arc::new(PostgresUserRepository::new(postgres.get_db()));
     let user = Arc::new(CachedUserRepository::new(
-        Arc::new(PostgresUserRepository::new(postgres.get_db())),
+        Arc::clone(&user_store),
         token_state.clone(),
     ));
     let credential = Arc::new(PostgresCredentialRepository::with_cipher(
@@ -870,7 +871,7 @@ pub async fn create_service_with_secrets(
             crate::domain::account_security::services::AccountSecurityServiceImpl::new(
                 credential.clone(),
                 hasher.clone(),
-                user.clone(),
+                Arc::clone(&user_store),
                 realm.clone(),
                 password_policy.clone(),
                 otp_enrollment.clone(),
@@ -879,6 +880,7 @@ pub async fn create_service_with_secrets(
                 other_sessions_revocation.clone(),
                 user_required_action.clone(),
                 passkey_registration.clone(),
+                security_event.clone(),
             ),
         user_service: UserServiceImpl::new(
             realm.clone(),
